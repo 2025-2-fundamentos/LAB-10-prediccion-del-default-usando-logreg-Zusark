@@ -95,3 +95,147 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import gzip
+import json
+import pickle
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+
+
+def leer_particiones() -> tuple[pd.DataFrame, pd.DataFrame]:
+    train = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+    test = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+    return train, test
+
+
+def normalizar_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = out.rename(columns={"default payment next month": "default"})
+    if "ID" in out.columns:
+        out = out.drop(columns=["ID"])
+    out = out[(out["EDUCATION"] != 0) & (out["MARRIAGE"] != 0)]
+    out["EDUCATION"] = out["EDUCATION"].where(out["EDUCATION"] <= 4, 4)
+    out = out.dropna()
+    return out
+
+
+def separar_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    x = df.drop(columns=["default"])
+    y = df["default"]
+    return x, y
+
+
+def construir_busqueda(x_train: pd.DataFrame) -> GridSearchCV:
+    categ = ["SEX", "EDUCATION", "MARRIAGE"]
+    num = [c for c in x_train.columns if c not in categ]
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categ),
+            ("num", MinMaxScaler(), num),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+    pipe = Pipeline(
+        steps=[
+            ("prep", pre),
+            ("sel", SelectKBest(score_func=f_regression)),
+            ("clf", LogisticRegression(max_iter=1000, random_state=42)),
+        ]
+    )
+
+    grid = {
+        "sel__k": list(range(1, x_train.shape[1] + 1)),
+        "clf__C": [0.1, 1, 10],
+        "clf__solver": ["liblinear", "lbfgs"],
+    }
+
+    return GridSearchCV(
+        estimator=pipe,
+        param_grid=grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        refit=True,
+        n_jobs=-1,
+    )
+
+
+def guardar_modelo(modelo: GridSearchCV) -> None:
+    Path("files/models").mkdir(parents=True, exist_ok=True)
+    with gzip.open("files/models/model.pkl.gz", "wb") as f:
+        pickle.dump(modelo, f)
+
+
+def armar_metricas(dataset: str, y_true, y_pred) -> dict:
+    return {
+        "type": "metrics",
+        "dataset": dataset,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def armar_confusion(dataset: str, y_true, y_pred) -> dict:
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset,
+        "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])},
+    }
+
+
+def escribir_salida(filas: list[dict]) -> None:
+    Path("files/output").mkdir(parents=True, exist_ok=True)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+        for fila in filas:
+            f.write(json.dumps(fila) + "\n")
+
+
+def ejecutar() -> None:
+    df_train, df_test = leer_particiones()
+
+    df_train = normalizar_dataset(df_train)
+    df_test = normalizar_dataset(df_test)
+
+    x_train, y_train = separar_xy(df_train)
+    x_test, y_test = separar_xy(df_test)
+
+    modelo = construir_busqueda(x_train)
+    modelo.fit(x_train, y_train)
+
+    guardar_modelo(modelo)
+
+    yhat_train = modelo.predict(x_train)
+    yhat_test = modelo.predict(x_test)
+
+    escribir_salida(
+        [
+            armar_metricas("train", y_train, yhat_train),
+            armar_metricas("test", y_test, yhat_test),
+            armar_confusion("train", y_train, yhat_train),
+            armar_confusion("test", y_test, yhat_test),
+        ]
+    )
+
+
+if __name__ == "__main__":
+    ejecutar()
